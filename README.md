@@ -12,8 +12,9 @@ A high-performance, semi-automatic segmentation annotation tool designed for loc
 
 ### Backend
 - **FastAPI**: Asynchronous Python web framework for serving APIs and static assets.
-- **Ultralytics**: For running local YOLO segmentation models (`/inference/yolo`).
-- **PyTorch & SAM2**: For executing Segment Anything Model 2 based on point prompts (`/inference/sam`).
+- **Ultralytics**: For running local YOLO segmentation models (`/inference/yolo`) and SAM2 models (`/inference/sam`).
+- **PyTorch & SAM2**: Integrated natively via Ultralytics for executing Segment Anything Model 2 based on bounding box or point prompts.
+- **OpenCV**: Used for polygon contour simplification (Douglas-Peucker algorithm) to optimize polygon point counts.
 - **Uvicorn**: High-performance ASGI server for local hosting.
 
 ## Features & Workflow
@@ -21,16 +22,23 @@ A high-performance, semi-automatic segmentation annotation tool designed for loc
 1. **Local Dataset Explorer**: Reads directly from your local `dataset/images/` directory. Upload new images instantly through the UI.
 2. **AI-Assisted Annotation**:
    - **Auto YOLO Seg**: Click one button to run a pre-trained YOLO model and automatically outline the detected object.
-   - **SAM Refine Tool**: Click directly on the image to place positive (Left Click) or negative (Right Click) points. The backend SAM model will dynamically draw a tight mask around the object.
+   - **SAM Refine Tool**: Draw bounding boxes or place points on an image. The backend SAM2 Large model (lazy-loaded for performance) will dynamically compute a tight mask around the object. Mask contours are automatically optimized using the Douglas-Peucker algorithm to reduce unnecessary points.
 3. **Manual Override Tools**:
    - **Manual Rectangle**: Click and drag to create precise bounding boxes.
    - **Manual Polygon**: Click around the edges of an object and press `Enter` (or click near the starting point) to snap the shape closed.
-4. **Instant YOLO Formatter**: Press `S` to instantly normalize all coordinates and append them to a `.txt` file in `dataset/labels/` matching YOLO's strict formatting.
+   - **Freehand Tool**: Draw organically, and the tool will construct a polygon from the drawn path.
+4. **Annotation Management**:
+   - Pre-configured classes for waste management (Plastic, Paper, Glass, Metal, Organic).
+   - Easily update object classes and boundaries on the fly.
+   - Delete incorrectly drawn objects with real-time UI/backend synchronization via the `/save_all` endpoint.
+   - Hotkey support for fast class switching (1-5) and navigation (A/D).
+5. **Instant YOLO Formatter**: Press `S` or click Save to instantly normalize all coordinates and append them to a `.txt` file in `dataset/labels/` matching YOLO's strict formatting. 
+6. **Dynamic Model Loading**: Upload and load your custom `.pt` model weights directly from the settings interface.
 
 ## Setup & Running
 
 1. **Install Dependencies**:
-   - *Backend*: `pip install -r backend/requirements.txt`
+   - *Backend*: `pip install -r backend/requirements.txt` (ensure `ultralytics` and `opencv-python` are installed)
    - *Frontend*: `cd frontend && npm install`
 2. **Run the Application**:
    Simply execute `start_all.bat` from the root directory. This will simultaneously launch the FastAPI backend on port 8000 and the Vite frontend on port 5173.
@@ -41,8 +49,8 @@ A high-performance, semi-automatic segmentation annotation tool designed for loc
 YOLO Segmentation Annotator
 │
 ├── Frontend (React)
-│   ├── Image Viewer
-│   ├── Polygon Editor
+│   ├── Image Viewer & Polygon Editor
+│   ├── Object Manager (Sidebar)
 │   └── Dataset Explorer
 │
 ├── Backend (FastAPI)
@@ -52,7 +60,7 @@ YOLO Segmentation Annotator
 │
 ├── Models
 │   ├── yolo_model.pt
-│   └── sam2.pt
+│   └── sam2_l.pt
 │
 └── Dataset
     ├── images/
