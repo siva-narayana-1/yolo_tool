@@ -4,6 +4,16 @@ from typing import List, Optional
 import os
 import shutil
 import glob
+import cv2
+import numpy as np
+
+try:
+    from ultralytics import SAM
+    # We will initialize this lazily so it doesn't block server startup
+    sam_model = None
+except ImportError:
+    sam_model = None
+    print("Warning: ultralytics not installed. SAM inference will fail.")
 
 router = APIRouter()
 
@@ -29,7 +39,8 @@ class InferenceRequestYOLO(BaseModel):
 
 class InferenceRequestSAM(BaseModel):
     image_name: str
-    points: List[Point]
+    points: Optional[List[Point]] = None
+    bbox: Optional[List[float]] = None # [xmin, ymin, xmax, ymax]
 
 class SaveLabelRequest(BaseModel):
     image_name: str
@@ -115,33 +126,66 @@ async def run_yolo(req: InferenceRequestYOLO):
 
 @router.post("/inference/sam")
 async def run_sam(req: InferenceRequestSAM):
+    global sam_model
+    if sam_model is None:
+        try:
+            from ultralytics import SAM
+            print("Lazy loading SAM2 Large model...")
+            sam_model = SAM("sam2_l.pt")
+        except ImportError:
+            raise HTTPException(status_code=500, detail="SAM model not loaded. Please install ultralytics.")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to load SAM: {e}")
+            
     image_path = os.path.join(IMAGES_DIR, req.image_name)
     if not os.path.exists(image_path):
         raise HTTPException(status_code=404, detail="Image not found")
         
-    # TODO: Connect to SAM2 model
-    # Mock response based on user clicks
-    if not req.points:
-        return {"polygon": [[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]]}
+    if not req.points and not req.bbox:
+        raise HTTPException(status_code=400, detail="No points or bbox provided")
         
-    # Calculate average of positive points to center the mock polygon
-    pos_points = [p for p in req.points if p.label == 1]
-    if not pos_points:
-        pos_points = req.points
+    try:
+        # Read image to get dimensions
+        img = cv2.imread(image_path)
+        if img is None:
+            raise HTTPException(status_code=500, detail="Failed to read image")
+            
+        h, w = img.shape[:2]
         
-    avg_x = sum(p.x for p in pos_points) / len(pos_points)
-    avg_y = sum(p.y for p in pos_points) / len(pos_points)
-    
-    # Return a 10% x 10% polygon around the click center
-    size = 0.05
-    poly = [
-        [max(0.0, avg_x - size), max(0.0, avg_y - size)],
-        [min(1.0, avg_x + size), max(0.0, avg_y - size)],
-        [min(1.0, avg_x + size), min(1.0, avg_y + size)],
-        [max(0.0, avg_x - size), min(1.0, avg_y + size)]
-    ]
-    
-    return {"polygon": poly}
+        # Run inference
+        if req.bbox:
+            pixel_bbox = [
+                req.bbox[0] * w,
+                req.bbox[1] * h,
+                req.bbox[2] * w,
+                req.bbox[3] * h
+            ]
+            results = sam_model(image_path, bboxes=[pixel_bbox], verbose=False)
+        else:
+            pixel_points = [[p.x * w, p.y * h] for p in req.points]
+            labels = [p.label for p in req.points]
+            results = sam_model(image_path, points=pixel_points, labels=labels, verbose=False)
+            
+        if not results or not results[0].masks:
+            raise HTTPException(status_code=500, detail="SAM failed to generate a mask")
+            
+        # Get the highest confidence mask boundary (usually index 0)
+        polygon_pixels = results[0].masks.xy[0]
+        
+        # Simplify polygon using Douglas-Peucker to reduce points
+        epsilon = 0.001 * max(w, h)
+        simplified = cv2.approxPolyDP(np.array(polygon_pixels), epsilon, True)
+        if simplified is not None and len(simplified) >= 3:
+            simplified = simplified.reshape(-1, 2)
+        else:
+            simplified = polygon_pixels # Fallback
+            
+        # Convert back to normalized coordinates [0, 1]
+        normalized_poly = [[float(pt[0]/w), float(pt[1]/h)] for pt in simplified]
+        
+        return {"polygon": normalized_poly}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/labels/{image_name}")
 async def get_labels(image_name: str):
@@ -185,6 +229,30 @@ async def save_label(req: SaveLabelRequest):
             # YOLO format: class_id x1 y1 x2 y2 ...
             coords_str = " ".join([f"{pt[0]:.6f} {pt[1]:.6f}" for pt in req.polygon])
             f.write(f"{req.class_id} {coords_str}\n")
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class SaveAllLabelsRequest(BaseModel):
+    image_name: str
+    polygons: List[dict] # List of {"classId": int, "points": [[x,y],...]}
+
+@router.post("/save_all")
+async def save_all_labels(req: SaveAllLabelsRequest):
+    label_file = os.path.splitext(req.image_name)[0] + ".txt"
+    label_path = os.path.join(LABELS_DIR, label_file)
+    
+    try:
+        # If the polygons list is empty, we just delete the file to keep the directory clean
+        if not req.polygons:
+            if os.path.exists(label_path):
+                os.remove(label_path)
+            return {"status": "success"}
+
+        with open(label_path, "w") as f:
+            for poly in req.polygons:
+                coords_str = " ".join([f"{pt[0]:.6f} {pt[1]:.6f}" for pt in poly["points"]])
+                f.write(f"{poly['classId']} {coords_str}\n")
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

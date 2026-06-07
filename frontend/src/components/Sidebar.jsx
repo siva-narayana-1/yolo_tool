@@ -56,7 +56,7 @@ function Sidebar({ images, annotatedImages, currentIndex, onSelect, onDatasetRef
     <div className="sidebar">
       <div className="sidebar-header" style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
         <div>
-            <h2>Dataset Explorer</h2>
+            <h2>Assimilate Vision</h2>
             <div style={{fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '5px'}}>
             {annotatedImages.length} / {images.length} Annotated
             </div>

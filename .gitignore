@@ -1,0 +1,15 @@
+# Ignore PyTorch model files
+*.pt
+*.pth
+
+# Virtual environments
+venv/
+env/
+.env
+
+# PyCache
+__pycache__/
+*.pyc
+
+# Node modules
+node_modules/
