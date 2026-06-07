@@ -2,12 +2,58 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Stage, Layer, Image as KonvaImage, Line, Circle, Rect } from 'react-konva';
 import useImage from 'use-image';
 
-function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualDraw, classes, selectedClassId }) {
+function perpendicularDistance(point, lineStart, lineEnd) {
+    let dx = lineEnd.x - lineStart.x;
+    let dy = lineEnd.y - lineStart.y;
+    if (dx === 0 && dy === 0) {
+        dx = point.x - lineStart.x;
+        dy = point.y - lineStart.y;
+        return Math.sqrt(dx * dx + dy * dy);
+    }
+    const t = ((point.x - lineStart.x) * dx + (point.y - lineStart.y) * dy) / (dx * dx + dy * dy);
+    if (t < 0) {
+        dx = point.x - lineStart.x;
+        dy = point.y - lineStart.y;
+    } else if (t > 1) {
+        dx = point.x - lineEnd.x;
+        dy = point.y - lineEnd.y;
+    } else {
+        const closestPointX = lineStart.x + t * dx;
+        const closestPointY = lineStart.y + t * dy;
+        dx = point.x - closestPointX;
+        dy = point.y - closestPointY;
+    }
+    return Math.sqrt(dx * dx + dy * dy);
+}
+
+function rdp(points, epsilon) {
+    if (points.length < 3) return points;
+    let dmax = 0;
+    let index = 0;
+    const end = points.length - 1;
+    for (let i = 1; i < end; i++) {
+        const d = perpendicularDistance(points[i], points[0], points[end]);
+        if (d > dmax) {
+            index = i;
+            dmax = d;
+        }
+    }
+    if (dmax > epsilon) {
+        const recResults1 = rdp(points.slice(0, index + 1), epsilon);
+        const recResults2 = rdp(points.slice(index), epsilon);
+        return recResults1.slice(0, recResults1.length - 1).concat(recResults2);
+    } else {
+        return [points[0], points[end]];
+    }
+}
+
+function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualDraw, onDeleteShape, classes, selectedClassId, selectedShapeIndex, setSelectedShapeIndex, updateShapePoints, updateShapePointsLocal }) {
   const [image] = useImage(imageUrl);
   const stageRef = useRef(null);
   const containerRef = useRef(null);
   const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
-  const [samPoints, setSamPoints] = useState([]);
+  const [stagePos, setStagePos] = useState({ x: 0, y: 0 });
+  const [stageScale, setStageScale] = useState(1);
   
   // Manual Drawing State
   const [isDrawing, setIsDrawing] = useState(false);
@@ -16,10 +62,11 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
 
   useEffect(() => {
     // Reset temporary states when image changes
-    setSamPoints([]);
     setDraftRect(null);
     setDraftPolygon([]);
     setIsDrawing(false);
+    setStagePos({ x: 0, y: 0 });
+    setStageScale(1);
   }, [imageUrl]);
 
   useEffect(() => {
@@ -41,24 +88,32 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  // Handle Enter key for polygon
+  // Handle Keyboard shortcuts for drawing
   useEffect(() => {
     const handleKeyDown = (e) => {
-      if (e.key === 'Enter' && activeTool === 'polygon') {
-        console.log("Enter pressed. draftPolygon length:", draftPolygon.length);
-        if (draftPolygon.length >= 3) {
-            const pointsArray = draftPolygon.map(p => [p.x, p.y]);
-            console.log("Finishing polygon via Enter with points:", pointsArray);
-            onManualDraw(pointsArray);
-            setDraftPolygon([]);
-        } else {
-            console.log("Not enough points to finish polygon.");
+      if (activeTool === 'polygon') {
+        if (e.key === 'Enter') {
+            console.log("Enter pressed. draftPolygon length:", draftPolygon.length);
+            if (draftPolygon.length >= 3) {
+                const pointsArray = draftPolygon.map(p => [p.x, p.y]);
+                console.log("Finishing polygon via Enter with points:", pointsArray);
+                onManualDraw(pointsArray);
+                setDraftPolygon([]);
+            } else {
+                console.log("Not enough points to finish polygon.");
+            }
+        } else if (e.key === 'Backspace' || e.key === 'Delete' || e.key === 'z') {
+            // Undo last point
+            setDraftPolygon(prev => {
+                if (prev.length === 0) return prev;
+                return prev.slice(0, -1);
+            });
         }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  });
+  }, [activeTool, draftPolygon, onManualDraw]);
 
   let scale = 1;
   let offsetX = 0;
@@ -75,9 +130,12 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
   const getRelativePointerPosition = () => {
     const stage = stageRef.current;
     if (!stage || !image) return null;
+    const transform = stage.getAbsoluteTransform().copy();
+    transform.invert();
     const pos = stage.getPointerPosition();
-    const x = (pos.x - offsetX) / (image.width * scale);
-    const y = (pos.y - offsetY) / (image.height * scale);
+    const stagePos = transform.point(pos);
+    const x = (stagePos.x - offsetX) / (image.width * scale);
+    const y = (stagePos.y - offsetY) / (image.height * scale);
     return { x, y };
   };
 
@@ -89,14 +147,40 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
   // MOUSE EVENTS
   // -------------------------
 
+  const handleWheel = (e) => {
+    e.evt.preventDefault();
+    const scaleBy = 1.1;
+    const stage = stageRef.current;
+    if (!stage) return;
+    const oldScale = stageScale;
+    const pointer = stage.getPointerPosition();
+
+    const mousePointTo = {
+      x: (pointer.x - stage.x()) / oldScale,
+      y: (pointer.y - stage.y()) / oldScale,
+    };
+
+    const newScale = e.evt.deltaY > 0 ? oldScale / scaleBy : oldScale * scaleBy;
+    if (newScale < 0.1 || newScale > 20) return;
+
+    setStageScale(newScale);
+    setStagePos({
+      x: pointer.x - mousePointTo.x * newScale,
+      y: pointer.y - mousePointTo.y * newScale,
+    });
+  };
+
   const handleMouseDown = (e) => {
     if (e.evt.button === 2) return; // Ignore right click for drawing start
     const pos = getRelativePointerPosition();
     if (!isWithinImage(pos)) return;
 
-    if (activeTool === 'rect') {
+    if (activeTool === 'rect' || activeTool === 'sam') {
       setIsDrawing(true);
       setDraftRect({ startX: pos.x, startY: pos.y, endX: pos.x, endY: pos.y });
+    } else if (activeTool === 'freehand') {
+      setIsDrawing(true);
+      setDraftPolygon([pos]);
     }
   };
 
@@ -108,13 +192,24 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
     const cx = Math.max(0, Math.min(1, pos.x));
     const cy = Math.max(0, Math.min(1, pos.y));
 
-    if (activeTool === 'rect' && isDrawing) {
+    if ((activeTool === 'rect' || activeTool === 'sam') && isDrawing) {
       setDraftRect(prev => ({ ...prev, endX: cx, endY: cy }));
+    } else if (activeTool === 'freehand' && isDrawing) {
+      setDraftPolygon(prev => {
+        if (prev.length === 0) return [pos];
+        const last = prev[prev.length - 1];
+        // Only record point if the mouse has moved enough (0.5% distance) to prevent enormous arrays
+        const dist = Math.sqrt(Math.pow(pos.x - last.x, 2) + Math.pow(pos.y - last.y, 2));
+        if (dist > 0.002) {
+          return [...prev, pos];
+        }
+        return prev;
+      });
     }
   };
 
   const handleMouseUp = (e) => {
-    if (activeTool === 'rect' && isDrawing && draftRect) {
+    if ((activeTool === 'rect' || activeTool === 'sam') && isDrawing && draftRect) {
       setIsDrawing(false);
       
       // Calculate 4 points of the rectangle
@@ -123,21 +218,37 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
       const x2 = Math.max(draftRect.startX, draftRect.endX);
       const y2 = Math.max(draftRect.startY, draftRect.endY);
 
-      console.log("Rect mouse up. Box dimensions:", Math.abs(x2 - x1), Math.abs(y2 - y1));
+      console.log("Box mouse up. Box dimensions:", Math.abs(x2 - x1), Math.abs(y2 - y1));
 
       // Avoid extremely tiny accidental clicks
       if (Math.abs(x2 - x1) > 0.001 && Math.abs(y2 - y1) > 0.001) {
-        console.log("Box is large enough, calling onManualDraw");
-        onManualDraw([
-          [x1, y1],
-          [x2, y1],
-          [x2, y2],
-          [x1, y2]
-        ]);
+        if (activeTool === 'sam') {
+            console.log("Sending bbox to SAM:", [x1, y1, x2, y2]);
+            onSamClick([x1, y1, x2, y2]);
+        } else {
+            console.log("Box is large enough, calling onManualDraw");
+            onManualDraw([
+              [x1, y1],
+              [x2, y1],
+              [x2, y2],
+              [x1, y2]
+            ]);
+        }
       } else {
         console.log("Box too small, ignoring.");
       }
       setDraftRect(null);
+    } else if (activeTool === 'freehand' && isDrawing) {
+      setIsDrawing(false);
+      if (draftPolygon.length >= 3) {
+        console.log("Finishing freehand polygon");
+        // Simplify the polygon using RDP to heavily reduce the number of anchor points
+        const simplified = rdp(draftPolygon, 0.002); 
+        const pointsArray = simplified.map(p => [p.x, p.y]);
+        console.log(`Simplified from ${draftPolygon.length} to ${simplified.length} points`);
+        onManualDraw(pointsArray);
+      }
+      setDraftPolygon([]); // Reset
     }
   };
 
@@ -145,14 +256,7 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
     const pos = getRelativePointerPosition();
     if (!isWithinImage(pos)) return;
 
-    if (activeTool === 'sam') {
-      if (e.evt.button === 2) e.evt.preventDefault();
-      const label = e.evt.button === 2 ? 0 : 1; 
-      const newPts = [...samPoints, { x: pos.x, y: pos.y, label }];
-      setSamPoints(newPts);
-      onSamClick(newPts);
-    } 
-    else if (activeTool === 'polygon') {
+    if (activeTool === 'polygon') {
       if (draftPolygon.length >= 3) {
         const firstPoint = draftPolygon[0];
         const dx = pos.x - firstPoint.x;
@@ -202,8 +306,9 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
   };
 
   let cursorStyle = 'default';
+  if (activeTool === 'pan') cursorStyle = 'grab';
   if (activeTool === 'sam') cursorStyle = 'crosshair';
-  if (activeTool === 'rect' || activeTool === 'polygon') cursorStyle = 'crosshair';
+  if (activeTool === 'rect' || activeTool === 'polygon' || activeTool === 'freehand') cursorStyle = 'crosshair';
 
   return (
     <div 
@@ -213,7 +318,18 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
       <Stage 
         width={dimensions.width} 
         height={dimensions.height}
+        x={stagePos.x}
+        y={stagePos.y}
+        scaleX={stageScale}
+        scaleY={stageScale}
         ref={stageRef}
+        onWheel={handleWheel}
+        draggable={activeTool === 'pan'}
+        onDragEnd={(e) => {
+          if (e.target === stageRef.current) {
+            setStagePos({ x: e.target.x(), y: e.target.y() });
+          }
+        }}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
@@ -242,31 +358,66 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
             }, []);
 
             return (
+              <React.Fragment key={idx}>
               <Line
-                key={idx}
                 points={flatPoints}
                 closed={true}
                 stroke={getClassColor(poly.classId)}
                 strokeWidth={3}
                 fill={`${getClassColor(poly.classId)}40`}
+                onContextMenu={(e) => {
+                    e.cancelBubble = true; 
+                    e.evt.preventDefault();
+                    if (onDeleteShape) {
+                        onDeleteShape(idx);
+                    }
+                }}
+                onClick={(e) => {
+                    if (activeTool === 'select' && setSelectedShapeIndex) {
+                        e.cancelBubble = true;
+                        setSelectedShapeIndex(idx);
+                    }
+                }}
               />
+              
+              {/* Draggable Anchors for Selected Shape */}
+              {selectedShapeIndex === idx && poly.points.map((pt, ptIdx) => {
+                const [sx, sy] = toScreenXY(pt[0], pt[1]);
+                return (
+                    <Circle
+                        key={`anchor-${idx}-${ptIdx}`}
+                        x={sx}
+                        y={sy}
+                        radius={5}
+                        fill="#ffffff"
+                        stroke="#000000"
+                        strokeWidth={1}
+                        draggable={true}
+                        onDragMove={(e) => {
+                            if (!updateShapePointsLocal) return;
+                            const pos = getRelativePointerPosition();
+                            if (!pos) return;
+                            const nx = Math.max(0, Math.min(1, pos.x));
+                            const ny = Math.max(0, Math.min(1, pos.y));
+                            const newPoints = [...poly.points];
+                            newPoints[ptIdx] = [nx, ny];
+                            updateShapePointsLocal(idx, newPoints);
+                        }}
+                        onDragEnd={(e) => {
+                            if (!updateShapePoints) return;
+                            const pos = getRelativePointerPosition();
+                            if (!pos) return;
+                            const nx = Math.max(0, Math.min(1, pos.x));
+                            const ny = Math.max(0, Math.min(1, pos.y));
+                            const newPoints = [...poly.points];
+                            newPoints[ptIdx] = [nx, ny];
+                            updateShapePoints(idx, newPoints);
+                        }}
+                    />
+                );
+              })}
+            </React.Fragment>
             );
-          })}
-
-          {/* SAM Points Feedback */}
-          {samPoints.map((pt, idx) => {
-             const [sx, sy] = toScreenXY(pt.x, pt.y);
-             return (
-              <Circle
-                key={idx}
-                x={sx}
-                y={sy}
-                radius={4}
-                fill={pt.label === 1 ? '#10b981' : '#ef4444'} 
-                stroke="#ffffff"
-                strokeWidth={1}
-              />
-            )
           })}
 
           {/* Draft Rectangle */}
@@ -277,6 +428,7 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
               width={Math.abs(draftRect.endX - draftRect.startX) * image.width * scale}
               height={Math.abs(draftRect.endY - draftRect.startY) * image.height * scale}
               stroke={getClassColor(selectedClassId)}
+              fill={`${getClassColor(selectedClassId)}40`}
               strokeWidth={2}
               dash={[5, 5]}
             />
@@ -291,12 +443,13 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
                   acc.push(sx, sy);
                   return acc;
                 }, [])}
-                closed={false}
+                closed={activeTool === 'freehand' || draftPolygon.length >= 3}
                 stroke={getClassColor(selectedClassId)}
+                fill={`${getClassColor(selectedClassId)}40`}
                 strokeWidth={2}
-                dash={[5, 5]}
+                dash={activeTool === 'freehand' ? [] : [5, 5]}
               />
-              {draftPolygon.map((pt, idx) => {
+              {activeTool === 'polygon' && draftPolygon.map((pt, idx) => {
                  const [sx, sy] = toScreenXY(pt.x, pt.y);
                  return (
                   <Circle
