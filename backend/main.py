@@ -4,7 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from api.routes import router as api_router
 import os
 
-app = FastAPI(title="YOLO & SAM2 Annotation Tool Backend")
+app = FastAPI(title="Assimilate Vision Backend")
 
 # Setup CORS
 app.add_middleware(
