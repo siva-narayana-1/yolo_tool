@@ -23,6 +23,7 @@ function App() {
   const [savedPolygons, setSavedPolygons] = useState([]);
   const [draftPolygon, setDraftPolygon] = useState(null);
   const [selectedShapeIndex, setSelectedShapeIndex] = useState(null); // For editing
+  const [samSession, setSamSession] = useState(null); // { bbox: [x1,y1,x2,y2], points: [{x, y, label}] }
   
   const [loading, setLoading] = useState(false);
 
@@ -56,6 +57,7 @@ function App() {
       } else if (e.key === 'd' || e.key === 'D') {
         setCurrentImageIndex(prev => Math.min(images.length - 1, prev + 1));
       } else if (e.key === 's' || e.key === 'S') {
+        e.preventDefault();
         saveAnnotation();
       }
       
@@ -73,6 +75,7 @@ function App() {
     setSavedPolygons([]);
     setDraftPolygon(null);
     setSelectedShapeIndex(null);
+    setSamSession(null);
     
     if (currentImageIndex >= 0 && images[currentImageIndex]) {
         fetchLabels(images[currentImageIndex]);
@@ -140,29 +143,43 @@ function App() {
         points: res.data.polygon,
         classId: selectedClass.id
       });
+      setSelectedShapeIndex(savedPolygons.length);
     } catch (err) {
       console.error(err);
     }
     setLoading(false);
   };
 
-  const runSam = async (bbox) => {
+  const runSam = async (bbox, points = []) => {
     if (currentImageIndex < 0) return;
     setLoading(true);
     try {
       const res = await axios.post(`${API_BASE}/inference/sam`, {
         image_name: images[currentImageIndex],
-        bbox: bbox
+        bbox: bbox,
+        points: points
       });
       
-      setDraftPolygon({
-        points: res.data.polygon,
-        classId: selectedClass.id
+      setSamSession(prev => {
+          if (!prev) return null;
+          return { ...prev, currentMask: res.data.polygon };
       });
     } catch (err) {
       console.error(err);
     }
     setLoading(false);
+  };
+
+  const handleSamBox = (bbox) => {
+    setSamSession({ bbox, points: [] });
+    runSam(bbox, []);
+  };
+
+  const handleSamPoint = (pt) => {
+    if (!samSession) return;
+    const newPoints = [...samSession.points, pt];
+    setSamSession({ ...samSession, points: newPoints });
+    runSam(samSession.bbox, newPoints);
   };
 
   const handleManualDraw = (newPolygon) => {
@@ -170,20 +187,33 @@ function App() {
       points: newPolygon,
       classId: selectedClass.id
     });
+    setSelectedShapeIndex(savedPolygons.length);
   };
 
   const saveAnnotation = async () => {
-    if (currentImageIndex < 0 || !draftPolygon) return;
+    let polygonToSave = null;
+    if (samSession && samSession.currentMask) {
+        polygonToSave = {
+            points: samSession.currentMask,
+            classId: selectedClass.id
+        };
+    } else if (draftPolygon) {
+        polygonToSave = draftPolygon;
+    }
+
+    if (currentImageIndex < 0 || !polygonToSave) return;
     
     try {
-      await axios.post(`${API_BASE}/save`, {
+      const updatedPolygons = [...savedPolygons, polygonToSave];
+      await axios.post(`${API_BASE}/save_all`, {
         image_name: images[currentImageIndex],
-        class_id: draftPolygon.classId,
-        polygon: draftPolygon.points
+        polygons: updatedPolygons
       });
       
-      setSavedPolygons([...savedPolygons, draftPolygon]);
+      setSavedPolygons(updatedPolygons);
       setDraftPolygon(null);
+      setSamSession(null);
+      setSelectedShapeIndex(updatedPolygons.length - 1);
       
       const imgName = images[currentImageIndex];
       if (!annotatedImages.includes(imgName)) {
@@ -217,37 +247,49 @@ function App() {
   };
 
   const updateShapeClass = async (index, newClassId) => {
-    const newSaved = [...savedPolygons];
-    newSaved[index].classId = newClassId;
-    try {
-        await axios.post(`${API_BASE}/save_all`, {
-            image_name: images[currentImageIndex],
-            polygons: newSaved
-        });
-        setSavedPolygons(newSaved);
-    } catch (err) {
-        alert("Failed to update class.");
+    if (index === savedPolygons.length && draftPolygon) {
+        setDraftPolygon({ ...draftPolygon, classId: newClassId });
+    } else {
+        const newSaved = [...savedPolygons];
+        newSaved[index].classId = newClassId;
+        try {
+            await axios.post(`${API_BASE}/save_all`, {
+                image_name: images[currentImageIndex],
+                polygons: newSaved
+            });
+            setSavedPolygons(newSaved);
+        } catch (err) {
+            alert("Failed to update class.");
+        }
     }
   };
 
   const updateShapePoints = async (index, newPoints) => {
-    const newSaved = [...savedPolygons];
-    newSaved[index].points = newPoints;
-    try {
-        await axios.post(`${API_BASE}/save_all`, {
-            image_name: images[currentImageIndex],
-            polygons: newSaved
-        });
-        setSavedPolygons(newSaved);
-    } catch (err) {
-        alert("Failed to update points.");
+    if (index === savedPolygons.length && draftPolygon) {
+        setDraftPolygon({ ...draftPolygon, points: newPoints });
+    } else {
+        const newSaved = [...savedPolygons];
+        newSaved[index].points = newPoints;
+        try {
+            await axios.post(`${API_BASE}/save_all`, {
+                image_name: images[currentImageIndex],
+                polygons: newSaved
+            });
+            setSavedPolygons(newSaved);
+        } catch (err) {
+            alert("Failed to update points.");
+        }
     }
   };
 
   const updateShapePointsLocal = (index, newPoints) => {
-    const newSaved = [...savedPolygons];
-    newSaved[index].points = newPoints;
-    setSavedPolygons(newSaved);
+    if (index === savedPolygons.length && draftPolygon) {
+        setDraftPolygon({ ...draftPolygon, points: newPoints });
+    } else {
+        const newSaved = [...savedPolygons];
+        newSaved[index].points = newPoints;
+        setSavedPolygons(newSaved);
+    }
   };
 
   const allPolygons = [...savedPolygons];
@@ -279,18 +321,18 @@ function App() {
         </div>
 
         <div className="header-actions">
-           <button className="secondary-btn" onClick={() => fileInputRef.current.click()} title="Upload Dataset Images">
+           <button type="button" className="secondary-btn" onClick={() => fileInputRef.current.click()} title="Upload Dataset Images">
               <Upload size={14} /> Upload
            </button>
-           <button className="primary-btn" onClick={saveAnnotation} disabled={!draftPolygon}>
-              <Save size={14} /> Save (S)
-           </button>
+            <button type="button" className="primary-btn" onClick={saveAnnotation} disabled={!draftPolygon && !(samSession && samSession.currentMask)}>
+              <Save size={16} /> Save (S)
+            </button>
         </div>
       </header>
 
       {/* LEFT TOOLBAR */}
       <aside className="cvat-toolbar">
-         <button className={`tool-icon-btn ${activeTool === 'pan' ? 'active' : ''}`} onClick={() => setActiveTool('pan')} title="Pan (Drag canvas)">
+         <button type="button" className={`tool-icon-btn ${activeTool === 'pan' ? 'active' : ''}`} onClick={() => setActiveTool('pan')} title="Pan (Drag canvas)">
            <Hand size={18} />
          </button>
          <button className={`tool-icon-btn ${activeTool === 'select' ? 'active' : ''}`} onClick={() => setActiveTool('select')} title="Pointer (Edit/Select)">
@@ -327,9 +369,9 @@ function App() {
             imageUrl={`http://127.0.0.1:8000/images/${encodeURIComponent(images[currentImageIndex])}`}
             polygons={allPolygons}
             activeTool={activeTool}
-            onSamClick={(pts) => {
-              if (activeTool === 'sam') runSam(pts);
-            }}
+            samSession={samSession}
+            onSamBox={handleSamBox}
+            onSamPoint={handleSamPoint}
             onManualDraw={handleManualDraw}
             onDeleteShape={handleDeleteShape}
             classes={CLASSES}
@@ -344,9 +386,9 @@ function App() {
         )}
 
         {loading && (
-          <div className="loading-overlay">
-            <div className="loading-spinner"></div>
-            <div>Processing...</div>
+          <div style={{ position: 'absolute', top: 16, right: 16, backgroundColor: '#1e1e1e', padding: '8px 16px', borderRadius: '8px', zIndex: 1000, display: 'flex', alignItems: 'center', gap: '8px', border: '1px solid #383838', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.5)' }}>
+            <div className="loading-spinner" style={{ width: 16, height: 16, marginBottom: 0, borderWidth: 2 }}></div>
+            <span style={{ fontSize: '12px', fontWeight: 500 }}>SAM Processing...</span>
           </div>
         )}
       </main>
@@ -377,14 +419,14 @@ function App() {
         {/* Objects Section */}
         <div className="sidebar-section flex-1" style={{maxHeight: '40%'}}>
           <div className="section-header">
-            Objects <span>{savedPolygons.length}</span>
+            Objects <span>{allPolygons.length}</span>
           </div>
           <div className="section-content">
-              {savedPolygons.length === 0 && <div style={{color: 'var(--text-muted)', fontSize: '11px'}}>No objects.</div>}
-              {savedPolygons.map((poly, idx) => (
+              {allPolygons.length === 0 && <div style={{color: 'var(--text-muted)', fontSize: '11px'}}>No objects.</div>}
+              {allPolygons.map((poly, idx) => (
                   <div 
                       key={idx} 
-                      className={`anno-item ${selectedShapeIndex === idx ? 'selected' : ''}`} 
+                      className={`anno-item ${selectedShapeIndex === idx ? 'selected' : ''} ${idx === savedPolygons.length ? 'draft' : ''}`} 
                       onClick={() => setSelectedShapeIndex(idx)}
                   >
                       <div className="anno-color-box" style={{backgroundColor: CLASSES.find(c => c.id === poly.classId)?.color || '#fff'}}></div>
