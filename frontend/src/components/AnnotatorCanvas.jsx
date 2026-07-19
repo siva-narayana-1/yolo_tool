@@ -47,7 +47,7 @@ function rdp(points, epsilon) {
     }
 }
 
-function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualDraw, onDeleteShape, classes, selectedClassId, selectedShapeIndex, setSelectedShapeIndex, updateShapePoints, updateShapePointsLocal }) {
+function AnnotatorCanvas({ imageUrl, polygons, activeTool, samSession, onSamBox, onSamPoint, onManualDraw, onDeleteShape, classes, selectedClassId, selectedShapeIndex, setSelectedShapeIndex, updateShapePoints, updateShapePointsLocal }) {
   const [image] = useImage(imageUrl);
   const stageRef = useRef(null);
   const containerRef = useRef(null);
@@ -171,11 +171,12 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
   };
 
   const handleMouseDown = (e) => {
-    if (e.evt.button === 2) return; // Ignore right click for drawing start
+    if (e.evt.button === 2 && activeTool !== 'sam') return; // Ignore right click unless SAM
     const pos = getRelativePointerPosition();
     if (!isWithinImage(pos)) return;
 
-    if (activeTool === 'rect' || activeTool === 'sam') {
+    if (activeTool === 'rect' || (activeTool === 'sam' && !samSession)) {
+      if (e.evt.button === 2) return; // Only left click for drawing boxes
       setIsDrawing(true);
       setDraftRect({ startX: pos.x, startY: pos.y, endX: pos.x, endY: pos.y });
     } else if (activeTool === 'freehand') {
@@ -192,7 +193,7 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
     const cx = Math.max(0, Math.min(1, pos.x));
     const cy = Math.max(0, Math.min(1, pos.y));
 
-    if ((activeTool === 'rect' || activeTool === 'sam') && isDrawing) {
+    if ((activeTool === 'rect' || (activeTool === 'sam' && !samSession)) && isDrawing) {
       setDraftRect(prev => ({ ...prev, endX: cx, endY: cy }));
     } else if (activeTool === 'freehand' && isDrawing) {
       setDraftPolygon(prev => {
@@ -209,7 +210,12 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
   };
 
   const handleMouseUp = (e) => {
-    if ((activeTool === 'rect' || activeTool === 'sam') && isDrawing && draftRect) {
+    const pos = getRelativePointerPosition();
+    if (!pos) return;
+    const cx = Math.max(0, Math.min(1, pos.x));
+    const cy = Math.max(0, Math.min(1, pos.y));
+
+    if ((activeTool === 'rect' || (activeTool === 'sam' && !samSession)) && isDrawing && draftRect) {
       setIsDrawing(false);
       
       // Calculate 4 points of the rectangle
@@ -224,7 +230,7 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
       if (Math.abs(x2 - x1) > 0.001 && Math.abs(y2 - y1) > 0.001) {
         if (activeTool === 'sam') {
             console.log("Sending bbox to SAM:", [x1, y1, x2, y2]);
-            onSamClick([x1, y1, x2, y2]);
+            onSamBox([x1, y1, x2, y2]);
         } else {
             console.log("Box is large enough, calling onManualDraw");
             onManualDraw([
@@ -238,6 +244,10 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
         console.log("Box too small, ignoring.");
       }
       setDraftRect(null);
+    } else if (activeTool === 'sam' && samSession && isWithinImage(pos)) {
+        // Intercept click to add positive/negative point prompts
+        const label = e.evt.button === 2 ? 0 : 1; // 0 = negative, 1 = positive
+        onSamPoint({ x: cx, y: cy, label });
     } else if (activeTool === 'freehand' && isDrawing) {
       setIsDrawing(false);
       if (draftPolygon.length >= 3) {
@@ -364,7 +374,7 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
                 closed={true}
                 stroke={getClassColor(poly.classId)}
                 strokeWidth={3}
-                fill={`${getClassColor(poly.classId)}40`}
+                fill={`${getClassColor(poly.classId)}80`}
                 onContextMenu={(e) => {
                     e.cancelBubble = true; 
                     e.evt.preventDefault();
@@ -393,6 +403,9 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
                         stroke="#000000"
                         strokeWidth={1}
                         draggable={true}
+                        onMouseDown={(e) => { e.cancelBubble = true; }}
+                        onMouseUp={(e) => { e.cancelBubble = true; }}
+                        onClick={(e) => { e.cancelBubble = true; }}
                         onDragMove={(e) => {
                             if (!updateShapePointsLocal) return;
                             const pos = getRelativePointerPosition();
@@ -404,6 +417,7 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
                             updateShapePointsLocal(idx, newPoints);
                         }}
                         onDragEnd={(e) => {
+                            e.cancelBubble = true;
                             if (!updateShapePoints) return;
                             const pos = getRelativePointerPosition();
                             if (!pos) return;
@@ -428,10 +442,56 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
               width={Math.abs(draftRect.endX - draftRect.startX) * image.width * scale}
               height={Math.abs(draftRect.endY - draftRect.startY) * image.height * scale}
               stroke={getClassColor(selectedClassId)}
-              fill={`${getClassColor(selectedClassId)}40`}
+              fill={`${getClassColor(selectedClassId)}80`}
               strokeWidth={2}
               dash={[5, 5]}
             />
+          )}
+
+          {/* SAM Session Box & Points & Mask */}
+          {samSession && (
+            <>
+              {samSession.currentMask && (
+                <Line
+                    points={samSession.currentMask.reduce((acc, pt) => {
+                      const [sx, sy] = toScreenXY(pt[0], pt[1]);
+                      acc.push(sx, sy);
+                      return acc;
+                    }, [])}
+                    closed={true}
+                    fill="rgba(255, 255, 255, 0.5)"
+                    stroke="#fff"
+                    strokeWidth={2}
+                    listening={false}
+                />
+              )}
+              <Rect 
+                x={toScreenXY(samSession.bbox[0], 0)[0]}
+                y={toScreenXY(0, samSession.bbox[1])[1]}
+                width={(samSession.bbox[2] - samSession.bbox[0]) * image.width * scale}
+                height={(samSession.bbox[3] - samSession.bbox[1]) * image.height * scale}
+                stroke="#10b981"
+                strokeWidth={1}
+                dash={[5, 5]}
+              />
+              {samSession.points.map((pt, idx) => {
+                 const [sx, sy] = toScreenXY(pt.x, pt.y);
+                 return (
+                  <Circle
+                    key={`sam-pt-${idx}`}
+                    x={sx}
+                    y={sy}
+                    radius={4}
+                    fill={pt.label === 1 ? '#10b981' : '#ef4444'}
+                    stroke="#fff"
+                    strokeWidth={1}
+                    onMouseDown={(e) => { e.cancelBubble = true; }}
+                    onMouseUp={(e) => { e.cancelBubble = true; }}
+                    onClick={(e) => { e.cancelBubble = true; }}
+                  />
+                 )
+              })}
+            </>
           )}
 
           {/* Draft Polygon */}
@@ -445,7 +505,7 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, onSamClick, onManualD
                 }, [])}
                 closed={activeTool === 'freehand' || draftPolygon.length >= 3}
                 stroke={getClassColor(selectedClassId)}
-                fill={`${getClassColor(selectedClassId)}40`}
+                fill={`${getClassColor(selectedClassId)}80`}
                 strokeWidth={2}
                 dash={activeTool === 'freehand' ? [] : [5, 5]}
               />

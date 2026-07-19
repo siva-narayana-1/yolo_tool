@@ -153,6 +153,7 @@ async def run_sam(req: InferenceRequestSAM):
         h, w = img.shape[:2]
         
         # Run inference
+        pixel_bbox = None
         if req.bbox:
             pixel_bbox = [
                 req.bbox[0] * w,
@@ -160,11 +161,21 @@ async def run_sam(req: InferenceRequestSAM):
                 req.bbox[2] * w,
                 req.bbox[3] * h
             ]
-            results = sam_model(image_path, bboxes=[pixel_bbox], verbose=False)
-        else:
+            
+        pixel_points = None
+        point_labels = None
+        if req.points and len(req.points) > 0:
             pixel_points = [[p.x * w, p.y * h] for p in req.points]
-            labels = [p.label for p in req.points]
-            results = sam_model(image_path, points=pixel_points, labels=labels, verbose=False)
+            point_labels = [p.label for p in req.points]
+
+        if pixel_bbox and pixel_points:
+            results = sam_model(image_path, bboxes=[pixel_bbox], points=[pixel_points], labels=[point_labels], verbose=False)
+        elif pixel_bbox:
+            results = sam_model(image_path, bboxes=[pixel_bbox], verbose=False)
+        elif pixel_points:
+            results = sam_model(image_path, points=[pixel_points], labels=[point_labels], verbose=False)
+        else:
+            raise HTTPException(status_code=400, detail="No valid prompt provided")
             
         if not results or not results[0].masks:
             raise HTTPException(status_code=500, detail="SAM failed to generate a mask")
