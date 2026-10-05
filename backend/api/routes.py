@@ -1,15 +1,16 @@
 from fastapi import APIRouter, HTTPException, BackgroundTasks, UploadFile, File, Form
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Union
 import os
 import shutil
 import glob
 import cv2
 import numpy as np
+import asyncio
 
 try:
     from ultralytics import SAM
-    # We will initialize this lazily so it doesn't block server startup
+    # Lazily initialized
     sam_model = None
 except ImportError:
     sam_model = None
@@ -17,18 +18,119 @@ except ImportError:
 
 router = APIRouter()
 
-# Use absolute paths relative to the current working directory (which is expected to be backend/)
-BASE_DIR = os.path.abspath(os.path.join(os.getcwd(), ".."))
-DATASET_DIR = os.path.join(BASE_DIR, "dataset")
-IMAGES_DIR = os.path.join(DATASET_DIR, "images")
-LABELS_DIR = os.path.join(DATASET_DIR, "labels")
-MODELS_DIR = os.path.join(BASE_DIR, "models")
+# Default base directory is the parent directory of backend/
+DEFAULT_BASE_DIR = os.path.abspath(os.path.join(os.getcwd(), ".."))
 
-# Ensure directories exist
-os.makedirs(IMAGES_DIR, exist_ok=True)
-os.makedirs(LABELS_DIR, exist_ok=True)
-os.makedirs(MODELS_DIR, exist_ok=True)
+class DatasetManager:
+    def __init__(self, base_dir: str):
+        self.base_dir = os.path.abspath(base_dir)
+        self.dataset_dir = os.path.join(self.base_dir, "dataset")
+        self.images_dir = os.path.join(self.dataset_dir, "images")
+        self.labels_dir = os.path.join(self.dataset_dir, "labels")
+        self.models_dir = os.path.join(self.base_dir, "models")
+        self._ensure_dirs()
 
+    def _ensure_dirs(self):
+        os.makedirs(self.dataset_dir, exist_ok=True)
+        os.makedirs(self.images_dir, exist_ok=True)
+        os.makedirs(self.labels_dir, exist_ok=True)
+        os.makedirs(self.models_dir, exist_ok=True)
+
+    def set_location(self, new_path: str):
+        if not new_path or not new_path.strip():
+            raise ValueError("Dataset path cannot be empty.")
+        
+        target_dir = os.path.abspath(os.path.normpath(new_path.strip()))
+        if not os.path.exists(target_dir):
+            raise ValueError(f"Directory '{target_dir}' does not exist.")
+        if not os.path.isdir(target_dir):
+            raise ValueError(f"'{target_dir}' is not a directory.")
+
+        self.dataset_dir = target_dir
+
+        # Check if there is an images/ subfolder or if images are in the root of dataset_dir
+        sub_images = os.path.join(target_dir, "images")
+        sub_labels = os.path.join(target_dir, "labels")
+
+        # Count images in sub_images vs root target_dir
+        def count_images_in(path):
+            if not os.path.isdir(path):
+                return 0
+            cnt = 0
+            for f in os.listdir(path):
+                if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp')):
+                    cnt += 1
+            return cnt
+
+        if os.path.isdir(sub_images) and (count_images_in(sub_images) > 0 or not count_images_in(target_dir)):
+            self.images_dir = sub_images
+        else:
+            # If images are in the folder directly
+            self.images_dir = target_dir
+
+        if os.path.isdir(sub_labels):
+            self.labels_dir = sub_labels
+        else:
+            # Create labels directory inside target_dir
+            labels_path = os.path.join(target_dir, "labels")
+            os.makedirs(labels_path, exist_ok=True)
+            self.labels_dir = labels_path
+
+    def get_classes_file(self) -> str:
+        # Check if classes.txt exists in dataset_dir or in labels_dir or in parent
+        candidates = [
+            os.path.join(self.dataset_dir, "classes.txt"),
+            os.path.join(self.labels_dir, "classes.txt"),
+            os.path.join(self.dataset_dir, "notes.json")
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+        return os.path.join(self.dataset_dir, "classes.txt")
+
+    def read_classes(self) -> List[str]:
+        classes_file = self.get_classes_file()
+        if os.path.exists(classes_file):
+            try:
+                with open(classes_file, "r", encoding="utf-8") as f:
+                    lines = [line.strip() for line in f.readlines() if line.strip()]
+                    return lines
+            except Exception as e:
+                print(f"Failed to read classes.txt: {e}")
+        return []
+
+    def save_classes(self, class_names: List[str]):
+        classes_file = os.path.join(self.dataset_dir, "classes.txt")
+        try:
+            with open(classes_file, "w", encoding="utf-8") as f:
+                for name in class_names:
+                    cleaned = name.strip()
+                    if cleaned:
+                        f.write(f"{cleaned}\n")
+        except Exception as e:
+            raise RuntimeError(f"Failed to save classes.txt: {e}")
+
+    def list_images(self):
+        images = []
+        if os.path.exists(self.images_dir):
+            for f in os.listdir(self.images_dir):
+                if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp')):
+                    images.append(f)
+        
+        # Sort naturally or alphabetically
+        images.sort()
+
+        annotated = []
+        for img in images:
+            label_file = os.path.splitext(img)[0] + ".txt"
+            if os.path.exists(os.path.join(self.labels_dir, label_file)):
+                annotated.append(img)
+
+        return images, annotated
+
+dataset_manager = DatasetManager(DEFAULT_BASE_DIR)
+
+# Pydantic models
 class Point(BaseModel):
     x: float
     y: float
@@ -47,35 +149,135 @@ class SaveLabelRequest(BaseModel):
     class_id: int
     polygon: List[List[float]] # List of [x, y] coordinates (normalized 0 to 1)
 
+class SaveAllLabelsRequest(BaseModel):
+    image_name: str
+    polygons: List[dict] # List of {"classId": int, "points": [[x,y],...]}
+
 class LoadModelRequest(BaseModel):
     model_type: str # 'yolo' or 'sam'
     model_name: str
 
+class SetLocationRequest(BaseModel):
+    dataset_path: str
+
+class SaveClassesRequest(BaseModel):
+    classes: Optional[List[dict]] = None # [{"id": 0, "name": "Plastic", ...}]
+    names: Optional[List[str]] = None    # ["Plastic", "Paper", ...]
+
+
 @router.get("/dataset")
 async def get_dataset():
-    # Return list of images
     try:
-        images = []
-        # Support case-insensitive extensions on Windows/Linux by checking manually
-        for f in os.listdir(IMAGES_DIR):
-            if f.lower().endswith(('.png', '.jpg', '.jpeg')):
-                images.append(f)
+        images, annotated = dataset_manager.list_images()
+        class_names = dataset_manager.read_classes()
         
-        # Determine which images are annotated
-        annotated = []
-        for img in images:
-            label_file = os.path.splitext(img)[0] + ".txt"
-            if os.path.exists(os.path.join(LABELS_DIR, label_file)):
-                annotated.append(img)
-                
-        return {"images": images, "annotated": annotated}
+        return {
+            "dataset_path": dataset_manager.dataset_dir,
+            "images_path": dataset_manager.images_dir,
+            "labels_path": dataset_manager.labels_dir,
+            "images": images,
+            "annotated": annotated,
+            "classes": class_names
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/dataset/set_location")
+async def set_dataset_location(req: SetLocationRequest):
+    try:
+        dataset_manager.set_location(req.dataset_path)
+        images, annotated = dataset_manager.list_images()
+        class_names = dataset_manager.read_classes()
+        return {
+            "status": "success",
+            "message": f"Dataset attached successfully from {dataset_manager.dataset_dir}",
+            "dataset_path": dataset_manager.dataset_dir,
+            "images_path": dataset_manager.images_dir,
+            "labels_path": dataset_manager.labels_dir,
+            "images": images,
+            "annotated": annotated,
+            "classes": class_names
+        }
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+def _run_tkinter_browse(initial_dir: str):
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        selected_dir = filedialog.askdirectory(
+            initialdir=initial_dir if os.path.exists(initial_dir) else os.getcwd(),
+            title="Select Dataset Main Folder"
+        )
+        root.destroy()
+        return selected_dir
+    except Exception as e:
+        print(f"Tkinter browse error: {e}")
+        return None
+
+@router.post("/dataset/browse")
+async def browse_dataset_folder():
+    try:
+        initial = dataset_manager.dataset_dir
+        selected = await asyncio.to_thread(_run_tkinter_browse, initial)
+        if selected:
+            dataset_manager.set_location(selected)
+            images, annotated = dataset_manager.list_images()
+            class_names = dataset_manager.read_classes()
+            return {
+                "status": "success",
+                "dataset_path": dataset_manager.dataset_dir,
+                "images_path": dataset_manager.images_dir,
+                "labels_path": dataset_manager.labels_dir,
+                "images": images,
+                "annotated": annotated,
+                "classes": class_names
+            }
+        else:
+            return {"status": "cancelled", "dataset_path": dataset_manager.dataset_dir}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/classes")
+async def get_classes():
+    try:
+        class_names = dataset_manager.read_classes()
+        return {
+            "names": class_names,
+            "classes": [{"id": idx, "name": name} for idx, name in enumerate(class_names)]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/classes")
+async def save_classes(req: SaveClassesRequest):
+    try:
+        names_to_save = []
+        if req.names is not None:
+            names_to_save = [n for n in req.names if n and n.strip()]
+        elif req.classes is not None:
+            # Sort by id or maintain order
+            sorted_classes = sorted(req.classes, key=lambda x: x.get('id', 0))
+            names_to_save = [c.get('name', '').strip() for c in sorted_classes if c.get('name', '').strip()]
+        
+        dataset_manager.save_classes(names_to_save)
+        return {
+            "status": "success",
+            "names": names_to_save,
+            "classes": [{"id": idx, "name": name} for idx, name in enumerate(names_to_save)]
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/upload_image")
 async def upload_image(file: UploadFile = File(...)):
     try:
-        file_location = os.path.join(IMAGES_DIR, file.filename)
+        file_location = os.path.join(dataset_manager.images_dir, file.filename)
         with open(file_location, "wb+") as file_object:
             shutil.copyfileobj(file.file, file_object)
         return {"status": "success", "filename": file.filename}
@@ -85,7 +287,7 @@ async def upload_image(file: UploadFile = File(...)):
 @router.post("/upload_model")
 async def upload_model(file: UploadFile = File(...)):
     try:
-        file_location = os.path.join(MODELS_DIR, file.filename)
+        file_location = os.path.join(dataset_manager.models_dir, file.filename)
         with open(file_location, "wb+") as file_object:
             shutil.copyfileobj(file.file, file_object)
         return {"status": "success", "filename": file.filename}
@@ -96,31 +298,28 @@ async def upload_model(file: UploadFile = File(...)):
 async def get_models():
     try:
         models = []
-        for f in os.listdir(MODELS_DIR):
-            if f.lower().endswith('.pt'):
-                models.append(f)
+        if os.path.exists(dataset_manager.models_dir):
+            for f in os.listdir(dataset_manager.models_dir):
+                if f.lower().endswith('.pt'):
+                    models.append(f)
         return {"models": models}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/load_model")
 async def load_model(req: LoadModelRequest):
-    model_path = os.path.join(MODELS_DIR, req.model_name)
+    model_path = os.path.join(dataset_manager.models_dir, req.model_name)
     if not os.path.exists(model_path):
         raise HTTPException(status_code=404, detail="Model file not found")
-    
-    # TODO: Initialize your Ultralytics YOLO or Meta SAM2 model here using `model_path`
-    # E.g., `global yolo_model; yolo_model = YOLO(model_path)`
     
     return {"status": "success", "message": f"{req.model_type.upper()} model loaded successfully"}
 
 @router.post("/inference/yolo")
 async def run_yolo(req: InferenceRequestYOLO):
-    image_path = os.path.join(IMAGES_DIR, req.image_name)
+    image_path = os.path.join(dataset_manager.images_dir, req.image_name)
     if not os.path.exists(image_path):
         raise HTTPException(status_code=404, detail="Image not found")
     
-    # TODO: Connect to actual YOLO model inference
     # Mock response for now: returning a square polygon
     return {"polygon": [[0.3, 0.3], [0.7, 0.3], [0.7, 0.7], [0.3, 0.7]], "confidence": 0.95, "class_id": 0}
 
@@ -131,13 +330,25 @@ async def run_sam(req: InferenceRequestSAM):
         try:
             from ultralytics import SAM
             print("Lazy loading SAM2 Large model...")
-            sam_model = SAM("sam2_l.pt")
+            # Look for sam model in backend or models folder
+            sam_candidates = [
+                os.path.join(os.getcwd(), "sam2_l.pt"),
+                os.path.join(os.getcwd(), "sam2_b.pt"),
+                os.path.join(dataset_manager.models_dir, "sam2_l.pt"),
+                "sam2_l.pt"
+            ]
+            chosen_sam = "sam2_l.pt"
+            for c in sam_candidates:
+                if os.path.exists(c):
+                    chosen_sam = c
+                    break
+            sam_model = SAM(chosen_sam)
         except ImportError:
             raise HTTPException(status_code=500, detail="SAM model not loaded. Please install ultralytics.")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load SAM: {e}")
             
-    image_path = os.path.join(IMAGES_DIR, req.image_name)
+    image_path = os.path.join(dataset_manager.images_dir, req.image_name)
     if not os.path.exists(image_path):
         raise HTTPException(status_code=404, detail="Image not found")
         
@@ -201,7 +412,7 @@ async def run_sam(req: InferenceRequestSAM):
 @router.get("/labels/{image_name}")
 async def get_labels(image_name: str):
     label_file = os.path.splitext(image_name)[0] + ".txt"
-    label_path = os.path.join(LABELS_DIR, label_file)
+    label_path = os.path.join(dataset_manager.labels_dir, label_file)
     
     if not os.path.exists(label_path):
         return {"labels": []}
@@ -233,7 +444,7 @@ async def get_labels(image_name: str):
 @router.post("/save")
 async def save_label(req: SaveLabelRequest):
     label_file = os.path.splitext(req.image_name)[0] + ".txt"
-    label_path = os.path.join(LABELS_DIR, label_file)
+    label_path = os.path.join(dataset_manager.labels_dir, label_file)
     
     try:
         with open(label_path, "a") as f:
@@ -244,17 +455,13 @@ async def save_label(req: SaveLabelRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-class SaveAllLabelsRequest(BaseModel):
-    image_name: str
-    polygons: List[dict] # List of {"classId": int, "points": [[x,y],...]}
-
 @router.post("/save_all")
 async def save_all_labels(req: SaveAllLabelsRequest):
     label_file = os.path.splitext(req.image_name)[0] + ".txt"
-    label_path = os.path.join(LABELS_DIR, label_file)
+    label_path = os.path.join(dataset_manager.labels_dir, label_file)
     
     try:
-        # If the polygons list is empty, we just delete the file to keep the directory clean
+        # If the polygons list is empty, delete the file to keep directory clean
         if not req.polygons:
             if os.path.exists(label_path):
                 os.remove(label_path)

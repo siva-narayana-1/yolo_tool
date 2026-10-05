@@ -47,7 +47,7 @@ function rdp(points, epsilon) {
     }
 }
 
-function AnnotatorCanvas({ imageUrl, polygons, activeTool, samSession, onSamBox, onSamPoint, onManualDraw, onDeleteShape, classes, selectedClassId, selectedShapeIndex, setSelectedShapeIndex, updateShapePoints, updateShapePointsLocal }) {
+function AnnotatorCanvas({ imageUrl, polygons, activeTool, samSession, onSamBox, onSamPoint, onManualDraw, onDeleteShape, classes = [], selectedClassId = 0, selectedShapeIndex, setSelectedShapeIndex, updateShapePoints, updateShapePointsLocal }) {
   const [image] = useImage(imageUrl);
   const stageRef = useRef(null);
   const containerRef = useRef(null);
@@ -303,7 +303,7 @@ function AnnotatorCanvas({ imageUrl, polygons, activeTool, samSession, onSamBox,
   };
 
   const getClassColor = (classId) => {
-    const cls = classes.find(c => c.id === classId);
+    const cls = classes?.find(c => c.id === classId);
     return cls ? cls.color : '#ffffff';
   };
 
