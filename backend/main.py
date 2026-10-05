@@ -1,7 +1,8 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from api.routes import router as api_router
+from fastapi.responses import FileResponse
+from api.routes import router as api_router, dataset_manager
 import os
 
 app = FastAPI(title="Assimilate Vision Backend")
@@ -15,18 +16,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Use absolute paths relative to backend directory
-BASE_DIR = os.path.abspath(os.path.join(os.getcwd(), ".."))
-DATASET_DIR = os.path.join(BASE_DIR, "dataset")
-IMAGES_DIR = os.path.join(DATASET_DIR, "images")
-
-os.makedirs(IMAGES_DIR, exist_ok=True)
-
-# Mount static files for images so the frontend can display them
-app.mount("/images", StaticFiles(directory=IMAGES_DIR), name="images")
-
 # Include API router
 app.include_router(api_router, prefix="/api")
+
+# Dynamic image serving route so any attached dataset directory works immediately
+@app.get("/images/{image_name:path}")
+async def serve_dataset_image(image_name: str):
+    image_path = os.path.join(dataset_manager.images_dir, image_name)
+    if not os.path.exists(image_path):
+        raise HTTPException(status_code=404, detail="Image not found in active dataset")
+    return FileResponse(image_path)
 
 if __name__ == "__main__":
     import uvicorn
